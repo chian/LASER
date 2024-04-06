@@ -53,6 +53,7 @@ def main():
             state = next_state
 
         logging.info(f"Episode {episode+1} concluded.")
+        logging.debug(f"Final hypothesis: {state.hypothesis}")
 
 def log_results(action, next_state, reward, done):
     # Implement logging of action results

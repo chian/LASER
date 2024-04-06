@@ -21,6 +21,8 @@ import torch.optim as optim
 from typing import Optional
 from langchain_core.messages.human import HumanMessage
 
+import logging
+
 DEBUG_MODE = True
 
 class AgentResponse(BaseModel):
@@ -63,9 +65,6 @@ class PolicyNetwork(nn.Module):
         if isinstance(self.network[-1], nn.Linear):
             nn.init.constant_(self.network[-1].weight, 0)
             nn.init.constant_(self.network[-1].bias, 0)
-    
-    def forward(self, x):
-        return self.network(x)
 
 class HypothesisEnvironment(AbstractEnvironment):
     phase_to_index = {
@@ -77,12 +76,13 @@ class HypothesisEnvironment(AbstractEnvironment):
 
     action_to_index = {
         "generate_initial_hypothesis": 0,
-        "generate_hypothesis": 1,
-        "provide_feedback": 2,
-        "modify_hypothesis": 3,
-        "conclude": 4
+        "provide_feedback": 1,
+        "modify_hypothesis": 2,
+        "conclude": 3
     }
 
+    choosable_actions = ["provide_feedback", "modify_hypothesis", "conclude"]  # Initial choosable actions, excluding "generate_initial_hypothesis"
+    
     def action_to_one_hot(self, action):
         vector_size = len(self.action_to_index)  # Number of actions
         one_hot_vector = [0] * vector_size
@@ -105,7 +105,7 @@ class HypothesisEnvironment(AbstractEnvironment):
         self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)  # Adjusted shape to (5,)
         self.llm = llm
         # Initialize the policy network with input_size=5
-        self.policy_network = PolicyNetwork(input_size=5, hidden_size=128, output_size=3)  # Adjusted input_size to 5
+        self.policy_network = PolicyNetwork(input_size=len(self.phase_to_index), hidden_size=128, output_size=len(self.choosable_actions))  # Adjusted input_size to 5
         self.optimizer = optim.Adam(self.policy_network.parameters(), lr=0.01)
         self.reset()  # Call reset to initialize the state
 
@@ -115,59 +115,67 @@ class HypothesisEnvironment(AbstractEnvironment):
         return self.state
 
     def step(self, action):
+        logging.debug(f"Executing action: {action} in state: {self.state.current_phase}")
         # Ensure this method correctly handles the action and updates the state
         if action == "generate_initial_hypothesis":
             self.generate_initial_hypothesis()
-            self.state.transition("hypothesis_generation")  # Transition to the next logical phase
-        elif action == "generate_hypothesis":
-            self.generate_hypothesis()
-            self.state.transition("feedback")  # Example transition, adjust as needed
+            self.state.transition(action)  # Transition to the next logical phase
         elif action == "provide_feedback":
             self.provide_feedback()
-            self.state.transition("modify_hypothesis")  # Example transition, adjust as needed
+            self.state.transition(action)  # Example transition, adjust as needed
         elif action == "conclude":
-            self.state.transition("conclusion")
+            self.state.transition(action)
             # Additional logic for concluding the session
         elif action == "modify_hypothesis":
             self.modify_hypothesis_based_on_feedback()
-            self.state.transition("feedback")  # Transition back for potentially more feedback
+            self.state.transition(action)  # Transition back for potentially more feedback
 
+        # After executing the action and transitioning the state, log the new state
+        logging.debug(f"New state after action: {self.state.current_phase}, Reward: {self.state.previous_score}")
+    
         reward = self.calculate_reward()
         done = self.state.current_phase == "conclusion"
 
+        logging.debug(f"New state after action: {self.state.current_phase}, Reward: {reward}, Done: {done}")
         return self.state, reward, done
 
     def select_action(self, state):
         if state.current_phase == "initial":
-            # Dynamically generate next_phases from action_to_index keys, excluding the initial action
-            # This assumes that the keys in action_to_index correspond to valid actions for transitioning phases
-            next_phases = [action for action in self.action_to_index.keys() if action != "generate_initial_hypothesis"]
-            
-            # Choose a random next phase from the dynamically generated list
-            random_next_phase = np.random.choice(next_phases)
-            
-            # Transition to the randomly chosen next phase
-            state.transition(random_next_phase)  # Assuming a transition method exists in the State class.
-            
-            # Return the action that corresponds to generating the initial hypothesis
-            return "generate_initial_hypothesis"
+            logging.info("Initial phase detected. Generating initial hypothesis.")
+            selected_action = "generate_initial_hypothesis"
         else:
+            logging.debug(f"Selecting action for state: {state.current_phase}")
             one_hot_vector = HypothesisEnvironment.phase_to_one_hot(state.current_phase)
             state_tensor = torch.FloatTensor(one_hot_vector).unsqueeze(0)
             
-            if not check_for_nan_inf(state_tensor):
-                print("Input contains NaN or Inf values.")
-                return None
-            if not check_for_negative_values(state_tensor):
-                print("Input contains negative values.")
-                return None
-            if not check_one_hot_vector(state_tensor):
-                print("Input is not a valid one-hot encoded vector.")
-                return None
-            
             action_probabilities = self.policy_network(state_tensor)
-            action = torch.multinomial(action_probabilities, 1).item()
-            return action
+            logging.debug(f"Action probabilities (raw): {action_probabilities}")
+            
+            action_probabilities = self.normalize_probabilities(action_probabilities)
+            logging.debug(f"Action probabilities (normalized): {action_probabilities}")
+            
+            action_index = torch.multinomial(action_probabilities, 1).item()
+            logging.info(f"Selected action: {action_index} for phase: {state.current_phase}")
+            
+            selected_action = self.choosable_actions[action_index]  # Use choosable_actions to map index to action
+
+        logging.info(f"Selected action: {selected_action} for phase: {state.current_phase}")
+
+        return selected_action
+
+    def normalize_probabilities(self, probabilities):
+        sum_prob = probabilities.sum()
+        if sum_prob <= 1e-6:
+            logging.warning("Sum of action probabilities too close to zero, adjusting.")
+            probabilities += 1e-6  # Adjust to avoid division by zero
+        if not torch.isfinite(probabilities).all():
+            logging.error("Action probabilities contain inf or nan, adjusting.")
+            probabilities = torch.full(probabilities.shape, 1.0 / probabilities.size(1))  # Uniform distribution as fallback
+        if (probabilities < 0).any():
+            logging.error("Action probabilities contain negative values, adjusting.")
+            probabilities = torch.clamp(probabilities, min=0)  # Clamp to non-negative values
+        probabilities = probabilities / probabilities.sum()  # Normalize
+        return probabilities
 
     def get_llm_response(self, prompt):
         if DEBUG_MODE:
@@ -183,17 +191,11 @@ class HypothesisEnvironment(AbstractEnvironment):
         except ValidationError as e:
             print("LLM response validation error:", e.json())
 
-    def generate_hypothesis(self):
-        # This method simulates the student generating a hypothesis
-        prompt = "Generate a hypothesis based on the current knowledge."
-        response = self.get_llm_response(prompt)
-        self.state.add_hypothesis(response['content'])
-
     def provide_feedback(self):
         # This method simulates the professor providing feedback on the current hypothesis
         prompt = f"Provide feedback on the hypothesis: {self.state.current_hypothesis}"
         response = self.get_llm_response(prompt)
-        self.state.add_feedback(response['feedback'])
+        self.state.add_feedback(response)
 
     def modify_hypothesis_based_on_feedback(self):
         # Assuming the current hypothesis and feedback are stored in the state
@@ -207,22 +209,32 @@ class HypothesisEnvironment(AbstractEnvironment):
         modified_hypothesis_response = self.get_llm_response(prompt)
         
         # Assuming the response contains a 'content' field with the modified hypothesis
-        modified_hypothesis = modified_hypothesis_response['content']
+        modified_hypothesis = modified_hypothesis_response
+        logging.debug(f"Modified hypothesis: {modified_hypothesis}")
         
         # Update the current hypothesis in the state
         self.state.modify_current_hypothesis(modified_hypothesis)
 
     def calculate_reward(self):
-        # Evaluate the hypothesis to get the quality score
-        quality_score = self.evaluate_hypothesis_with_llm(self.state.current_hypothesis)
+        # Evaluate the hypothesis to get the current quality score
+        current_score = self.evaluate_hypothesis_with_llm(self.state.current_hypothesis)
         
         # Calculate penalty for overused words
         penalty_score = penalize_overused_words(self.state.current_hypothesis)
         
-        # Adjust the quality score based on the penalty
-        adjusted_score = max(0, quality_score - penalty_score * 0.05)
+        # Adjust the current score based on the penalty
+        adjusted_current_score = max(0, current_score - penalty_score * 0.05)
         
-        return adjusted_score
+        # Calculate the reward based on the difference between the current score and the previous score
+        if self.state.previous_score is not None:
+            reward = adjusted_current_score - self.state.previous_score
+        else:
+            reward = adjusted_current_score  # If there is no previous score, use the current score as the reward
+        
+        # Update the state with the new score
+        self.state.add_score(adjusted_current_score)
+        
+        return reward
 
     def evaluate_hypothesis_with_llm(self, hypothesis):
         prompt = textwrap.dedent(
@@ -261,7 +273,10 @@ class HypothesisEnvironment(AbstractEnvironment):
         state_tensor = torch.FloatTensor(one_hot_vector).unsqueeze(0)
         action_hot_vector = self.action_to_one_hot(action)
         action_tensor = torch.FloatTensor(action_hot_vector).unsqueeze(0)
-        log_prob = torch.log(self.policy_network(state_tensor)[0, action_tensor.long()])
+        action_probabilities = self.policy_network(state_tensor)
+        action_probabilities_selected = action_probabilities.gather(1, action_tensor.long()).squeeze(1)
+        epsilon = 1e-6
+        log_prob = torch.log(action_probabilities_selected + epsilon)
         loss = -log_prob * reward
         loss = loss.mean()
         self.optimizer.zero_grad()
@@ -334,13 +349,3 @@ def check_one_hot_vector(tensor):
     if torch.sum(tensor) == 1 and len(torch.unique(tensor)) == 2 and torch.all((tensor == 0) | (tensor == 1)):
         return True
     return False
-
-# Example usage:
-state_tensor = torch.FloatTensor([0, 1, 0, 0, 0])  # Example one-hot encoded vector
-
-if not check_for_nan_inf(state_tensor):
-    print("Input contains NaN or Inf values.")
-if not check_for_negative_values(state_tensor):
-    print("Input contains negative values.")
-if not check_one_hot_vector(state_tensor):
-    print("Input is not a valid one-hot encoded vector.")
