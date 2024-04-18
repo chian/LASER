@@ -1,63 +1,94 @@
-import sys
-import os
+import torch
 import logging
+import sys, os
+import requests
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from ARGO_WRAPPER.ARGO import ArgoWrapper, ArgoEmbeddingWrapper
-from ARGO_WRAPPER.CustomLLM import ARGO_LLM, ARGO_EMBEDDING
+from ARGO_WRAPPER.ARGO import ArgoWrapper
+from ARGO_WRAPPER.CustomLLM import ARGO_LLM
 from environments.hypothesis.hypothesis_environment import HypothesisEnvironment
 from environments.hypothesis.state import State
 
-# Setup basic configuration for logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+def run_episode(env):
+    """
+    Run a single episode using the current policy and collect transitions.
+    """
+    states, actions, rewards, next_states, log_probs, dones = [], [], [], [], [], []
+    state = env.reset()
+    done = False
+    while not done:
+        action, log_prob, next_state, reward, done = take_action(env, state)
+        state_values = [len(state.hypotheses), len(state.feedback), len(state.scores), state.previous_score if state.previous_score is not None else 0]
+        states.append(torch.FloatTensor(state_values).unsqueeze(0))
+        actions.append(action)
+        rewards.append(reward)
+        next_state_values = [len(next_state.hypotheses), len(next_state.feedback), len(next_state.scores), next_state.previous_score if next_state.previous_score is not None else 0]
+        next_states.append(torch.FloatTensor(next_state_values).unsqueeze(0))
+        log_probs.append(log_prob)
+        dones.append(done)
+        state = next_state
+    return states, actions, rewards, next_states, log_probs, dones
+
+def take_action(env, state):
+    """
+    Take an action given a state using the current policy.
+    """
+    # Updated to include previous_score. Assuming latest_feedback is not directly used for action decision.
+    # Check if previous_score is None, if so, set a default value, e.g., 0
+    previous_score = state.previous_score if state.previous_score is not None else 0
+    state_values = [len(state.hypotheses), len(state.feedback), len(state.scores), previous_score]  # Updated line
+
+    state_tensor = torch.FloatTensor(state_values).unsqueeze(0)
+    action_probs = env.actor(state_tensor)
+    dist = torch.distributions.Categorical(action_probs)
+    action_index = dist.sample()
+    log_prob = dist.log_prob(action_index).item()
+    action_name = env.index_to_action[action_index.item()]
+    next_state, reward, done, _ = env.step(action_name)
+    return action_index.item(), log_prob, next_state, reward, done
+
+def process_episode_data(env, states, actions, rewards, next_states, log_probs, dones):
+    """
+    Process data from an episode, calculate returns and advantages, and perform PPO update.
+    """
+    values = [env.critic(state).item() for state in states]
+    returns, advantages = calculate_returns_and_advantages(rewards, values, dones)
+    env.ppo_update(states, actions, log_probs, returns, advantages)
+
+def calculate_returns_and_advantages(rewards, values, dones, gamma=0.99, tau=0.95):
+    """
+    Calculate GAE (Generalized Advantage Estimation) for returns and advantages.
+    """
+    returns = []
+    advantages = []
+    gae = 0
+    next_value = 0
+    for t in reversed(range(len(rewards))):
+        if t == len(rewards) - 1:
+            next_value = 0
+        else:
+            next_value = values[t + 1]
+        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+        gae = delta + gamma * tau * (1 - dones[t]) * gae
+        returns.insert(0, gae + values[t])
+        advantages.insert(0, gae)
+    return returns, advantages
 
 def main():
-    # Initialize ARGO wrappers
-    argo_embedding_wrapper_instance = ArgoEmbeddingWrapper()    
-    argo_embedding = ARGO_EMBEDDING(argo_embedding_wrapper_instance)
-    
+    #Initialize ARGO wrappers
     argo_wrapper_instance = ArgoWrapper()
-    llm = ARGO_LLM(argo=argo_wrapper_instance, model_type='gpt4', temperature=0.5)
+    llm = ARGO_LLM(argo=argo_wrapper_instance, model="gpt4", temp=0.5)
+    env = HypothesisEnvironment(llm)
+    env.set_initial_hypothesis("What is an example of a phenomenon where humanity as a whole lacks a good explanation for, but, taking into account the full set of human generated knowledge, an explanation is actually possible to generate? Please write the explanation. It must not be a hypothesis that has been previously proposed. A good explanation will be hard to vary.")
 
-    # Initialize the environment
-    env = HypothesisEnvironment(llm=llm)
 
-    num_episodes = 10  # Define the number of episodes
+    num_episodes = 10
 
     for episode in range(num_episodes):
-        logging.info(f"Starting episode {episode+1}/{num_episodes}")
-        state = env.reset()  # Reset the environment at the start of each episode
-        done = False
-        step_count = 0
-
-        while not done:
-            step_count += 1
-            logging.debug(f"Episode {episode+1}, Step {step_count}: Current state: {state.current_phase}")
-
-            # Select an action based on the current state
-            action = env.select_action(state)
-            logging.debug(f"Episode {episode+1}, Step {step_count}: Selected action: {action}")
-
-            # Execute the action and update the environment
-            next_state, reward, done = env.step(action)
-            logging.debug(f"Episode {episode+1}, Step {step_count}: Action executed. Next state: {next_state.current_phase}, Reward: {reward}, Done: {done}")
-
-            # Update the policy based on the reward
-            env.update_policy(action, reward, state)
-
-            # Log the results of the action
-            log_results(action, next_state, reward, done)
-
-            # Update the current state
-            state = next_state
-
-        logging.info(f"Episode {episode+1} concluded.")
-        logging.debug(f"Final hypothesis: {state.hypothesis}")
-
-def log_results(action, next_state, reward, done):
-    # Implement logging of action results
-    logging.info(f"Action: {action}, Reward: {reward}, Done: {done}")
+        states, actions, rewards, next_states, log_probs, dones = run_episode(env)
+        process_episode_data(env, states, actions, rewards, next_states, log_probs, dones)
+        logging.info(f"Episode {episode+1} finished with total reward: {sum(rewards)}")
 
 if __name__ == "__main__":
     main()

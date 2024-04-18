@@ -23,6 +23,7 @@ from langchain_core.messages.human import HumanMessage
 
 import logging
 
+logging.basicConfig(level=logging.DEBUG)
 DEBUG_MODE = True
 
 class AgentResponse(BaseModel):
@@ -37,34 +38,46 @@ class AgentResponse(BaseModel):
             raise ValueError('Role must be either "student", "professor", or "critic"')
         return v
 
-class EvaluationScore(BaseModel):
+class EvaluationResponse(BaseModel):
     score: float
 
     @validator('score')
-    def score_must_be_in_range(cls, v):
+    def score_must_be_valid(cls, v):
         if not (0 <= v <= 1):
             raise ValueError('Score must be between 0 and 1')
         return v
 
-class PolicyNetwork(nn.Module):
+class ActorNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
-        super(PolicyNetwork, self).__init__()
+        super(ActorNetwork, self).__init__()
         self.network = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, output_size),
+            nn.Softmax(dim=-1),
         )
-        self.initialize_network()
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+                nn.init.zeros_(layer.bias)
+    def forward(self, x):
+        return self.network(x)
+
+class CriticNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(CriticNetwork, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
+        for layer in self.network:
+            if isinstance(layer, nn.Linear):
+                nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+                nn.init.zeros_(layer.bias)
 
     def forward(self, x):
-        x = self.network(x)
-        return torch.softmax(x, dim=-1)  # Apply softmax here
-
-    def initialize_network(self):
-        # Initialize the weights and biases of the last layer to zero
-        if isinstance(self.network[-1], nn.Linear):
-            nn.init.constant_(self.network[-1].weight, 0)
-            nn.init.constant_(self.network[-1].bias, 0)
+        return self.network(x)
 
 class HypothesisEnvironment(AbstractEnvironment):
     phase_to_index = {
@@ -80,6 +93,8 @@ class HypothesisEnvironment(AbstractEnvironment):
         "modify_hypothesis": 2,
         "conclude": 3
     }
+    
+    index_to_action = {v: k for k, v in action_to_index.items()}
 
     choosable_actions = ["provide_feedback", "modify_hypothesis", "conclude"]  # Initial choosable actions, excluding "generate_initial_hypothesis"
     
@@ -102,24 +117,33 @@ class HypothesisEnvironment(AbstractEnvironment):
     def __init__(self, llm: ARGO_LLM):
         super(HypothesisEnvironment, self).__init__()
         self.action_space = spaces.Discrete(3)  # Three roles: student, professor, critic
-        self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)  # Adjusted shape to (5,)
-        self.llm = llm
-        # Initialize the policy network with input_size=5
-        self.policy_network = PolicyNetwork(input_size=len(self.phase_to_index), hidden_size=128, output_size=len(self.choosable_actions))  # Adjusted input_size to 5
-        self.optimizer = optim.Adam(self.policy_network.parameters(), lr=0.01)
-        self.reset()  # Call reset to initialize the state
+        self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)
+        self.llm = llm 
+        self.actor = ActorNetwork(input_size=len(self.phase_to_index), hidden_size=128, output_size=len(self.choosable_actions))
+        self.critic = CriticNetwork(input_size=len(self.phase_to_index), hidden_size=128)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=0.01)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.01)
+        self.reset()
+
+    def set_initial_hypothesis(self, initial_hypothesis):
+        self.initial_hypothesis = initial_hypothesis
+        print(f"Initial hypothesis set to: {self.initial_hypothesis}")  # Debug print
 
     def reset(self):
         # Initialize or reset the state here, for example:
         self.state = State()  # Assuming State is a class that represents the state
+        # Set phase_to_index from HypothesisEnvironment to State
+        self.state.set_phase_to_index(self.phase_to_index)
+        self.state.current_phase = "initial"
         return self.state
 
     def step(self, action):
+        # Existing step logic here
         logging.debug(f"Executing action: {action} in state: {self.state.current_phase}")
         # Ensure this method correctly handles the action and updates the state
         if action == "generate_initial_hypothesis":
-            self.generate_initial_hypothesis()
-            self.state.transition(action)  # Transition to the next logical phase
+            self.generate_initial_hypothesis(self.initial_hypothesis)
+            self.state.transition(action) # Transition to the next logical phase
         elif action == "provide_feedback":
             self.provide_feedback()
             self.state.transition(action)  # Example transition, adjust as needed
@@ -132,12 +156,28 @@ class HypothesisEnvironment(AbstractEnvironment):
 
         # After executing the action and transitioning the state, log the new state
         logging.debug(f"New state after action: {self.state.current_phase}, Reward: {self.state.previous_score}")
-    
-        reward = self.calculate_reward()
+
+        # Evaluate the current hypothesis to calculate the reward
+        reward = self.calculate_reward()  # This line is adjusted to use the calculate_reward method
+
+        # Check if the environment has reached a terminal state
         done = self.state.current_phase == "conclusion"
 
-        logging.debug(f"New state after action: {self.state.current_phase}, Reward: {reward}, Done: {done}")
-        return self.state, reward, done
+        # Adjusted part: Directly use state attributes or a custom method instead of converting to numpy
+        # Example: Assuming a method in State class that returns relevant data as a list or any non-numpy format
+        state_data = self.state.get_state_data(self.phase_to_index)  # Pass phase_to_index to get_state_data
+        state_tensor = torch.FloatTensor(state_data).unsqueeze(0)  # Convert the list to a tensor directly
+
+        action_probs = self.actor(state_tensor)
+        dist = torch.distributions.Categorical(action_probs)
+
+        action_index = self.action_to_index.get(action, None)
+        if action_index is None:
+            raise ValueError(f"Invalid action: {action}")
+
+        log_prob = dist.log_prob(torch.tensor(action_index))
+        
+        return self.state, reward, done, log_prob.item()
 
     def select_action(self, state):
         if state.current_phase == "initial":
@@ -148,34 +188,15 @@ class HypothesisEnvironment(AbstractEnvironment):
             one_hot_vector = HypothesisEnvironment.phase_to_one_hot(state.current_phase)
             state_tensor = torch.FloatTensor(one_hot_vector).unsqueeze(0)
             
-            action_probabilities = self.policy_network(state_tensor)
-            logging.debug(f"Action probabilities (raw): {action_probabilities}")
+            action_probabilities = self.actor(state_tensor)
+            dist = torch.distributions.Categorical(action_probabilities)
+            action = dist.sample().item()
             
-            action_probabilities = self.normalize_probabilities(action_probabilities)
-            logging.debug(f"Action probabilities (normalized): {action_probabilities}")
-            
-            action_index = torch.multinomial(action_probabilities, 1).item()
-            logging.info(f"Selected action: {action_index} for phase: {state.current_phase}")
-            
-            selected_action = self.choosable_actions[action_index]  # Use choosable_actions to map index to action
+            selected_action = self.choosable_actions[action]  # Use choosable_actions to map index to action
 
         logging.info(f"Selected action: {selected_action} for phase: {state.current_phase}")
 
         return selected_action
-
-    def normalize_probabilities(self, probabilities):
-        sum_prob = probabilities.sum()
-        if sum_prob <= 1e-6:
-            logging.warning("Sum of action probabilities too close to zero, adjusting.")
-            probabilities += 1e-6  # Adjust to avoid division by zero
-        if not torch.isfinite(probabilities).all():
-            logging.error("Action probabilities contain inf or nan, adjusting.")
-            probabilities = torch.full(probabilities.shape, 1.0 / probabilities.size(1))  # Uniform distribution as fallback
-        if (probabilities < 0).any():
-            logging.error("Action probabilities contain negative values, adjusting.")
-            probabilities = torch.clamp(probabilities, min=0)  # Clamp to non-negative values
-        probabilities = probabilities / probabilities.sum()  # Normalize
-        return probabilities
 
     def get_llm_response(self, prompt):
         if DEBUG_MODE:
@@ -202,13 +223,20 @@ class HypothesisEnvironment(AbstractEnvironment):
         current_hypothesis = self.state.current_hypothesis
         feedback = self.state.latest_feedback  # Assuming there's a way to access the latest feedback
 
-        # Generate a prompt for modifying the hypothesis based on feedback
-        prompt = f"Based on the feedback: '{feedback}', modify the following hypothesis: '{current_hypothesis}'"
+        prompt = textwrap.dedent(f"""
+            You will act as a collaborative team of thinkers, each wearing a different Thinking Hat, to refine a hypothesis based on provided feedback. Your goal is to enhance the hypothesis's creativity, factual accuracy, and overall quality. The Thinking Hat roles are:
+
+            - **Green Hat (Innovator):** Suggest creative improvements or new angles.
+            - **Black Hat (Realist):** Point out factual inaccuracies or logical flaws to correct.
+            - **White Hat (Analyst):** Offer evidence or data that could strengthen the hypothesis.
+
+            Based on the feedback: '{feedback}', refine the following hypothesis: '{current_hypothesis}'
+        """)
         
         # Invoke the LLM to generate a modified hypothesis
         modified_hypothesis_response = self.get_llm_response(prompt)
         
-        # Assuming the response contains a 'content' field with the modified hypothesis
+        # Assuming the response directly contains the modified hypothesis
         modified_hypothesis = modified_hypothesis_response
         logging.debug(f"Modified hypothesis: {modified_hypothesis}")
         
@@ -236,63 +264,80 @@ class HypothesisEnvironment(AbstractEnvironment):
         
         return reward
 
+    def ppo_update(self, states, actions, old_log_probs, returns, advantages, clip_param=0.2):
+        # Convert lists to tensors
+        states = torch.stack(states)
+        actions = torch.tensor(actions, dtype=torch.int64)
+        old_log_probs = torch.tensor(old_log_probs)
+        returns = torch.tensor(returns)
+        advantages = torch.tensor(advantages)
+
+        # Calculate current log probs and state values
+        action_probs = self.actor(states)
+        dist = torch.distributions.Categorical(action_probs)
+        current_log_probs = dist.log_prob(actions)
+
+        state_values = self.critic(states).squeeze(1)
+
+        # Calculate ratios
+        ratios = torch.exp(current_log_probs - old_log_probs)
+
+        # Calculate actor loss (PPO clipped objective)
+        surr1 = ratios * advantages
+        surr2 = torch.clamp(ratios, 1.0 - clip_param, 1.0 + clip_param) * advantages
+        actor_loss = -torch.min(surr1, surr2).mean()
+
+        # Calculate critic loss
+        critic_loss = (returns - state_values).pow(2).mean()
+
+        # Update actor and critic
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
     def evaluate_hypothesis_with_llm(self, hypothesis):
-        prompt = textwrap.dedent(
-            f"""
-            You are an AI capable of evaluating scientific hypotheses. After evaluating a hypothesis, 
-            you will provide a score between 0 and 1, where 0 means the hypothesis is completely 
-            invalid and 1 means it is fully valid. Your response should be in JSON format, including 
-            the score and any feedback you might have. For example, if you find a hypothesis to be 
-            moderately plausible, you might return {{"score": 0.5, "feedback": "The hypothesis is 
-            plausible but lacks empirical evidence."}}.
+        if hypothesis is None or hypothesis == "None":
+            print("Error: Hypothesis is None or not set.")  # Debug print
+            exit(0)  # Or handle the error appropriately
+        prompt = textwrap.dedent(f"""
+            You will act as a Six Thinking Hat System (STHS), working together to evaluate a hypothesis and come to a group consensus on its score. The score should reflect the hypothesis's creativity, factual accuracy, and overall quality, on a scale from 0 to 1.
+
+            Each Hat will contribute their perspective based on their expertise, and then you will collectively decide on a final score. The Thinking Hat personalities are as follows:
+
+            - **Blue Hat (Organizer):** Oversees the evaluation process, ensuring that each Hat's perspective is considered in the final score.
+            - **Green Hat (Innovator):** Assesses the hypothesis's creativity and originality.
+            - **Red Hat (Empath):** Provides insight into the hypothesis's emotional impact and relevance.
+            - **Yellow Hat (Optimist):** Highlights the hypothesis's strengths and potential positive outcomes.
+            - **Black Hat (Realist):** Critiques the hypothesis for factual accuracy, potential risks, and flaws.
+            - **White Hat (Analyst):** Analyzes the hypothesis for logical consistency and evidence-based support.
+
+            After each Hat has provided their input, collaborate to determine a final score that reflects the consensus of the group. 
 
             Evaluate this hypothesis: {hypothesis}
         """)
         response = self.get_llm_response(prompt)
         if DEBUG_MODE:
-            print(f"LLM Response (evaluate_hypothesis): {response}")  # Debugging print statement
+            print(f"LLM Response (evaluate_hypothesis): {response}")
 
-        # Assuming the response is a string in JSON format, parse it into a Python dictionary
+        # Parse and validate the response using the EvaluationResponse model
         try:
-            response_dict = json.loads(response)
-            if DEBUG_MODE:
-                print(response_dict)
-            evaluation_result = EvaluationScore(**response_dict)
-            return evaluation_result.score
-        except json.JSONDecodeError:
-            if DEBUG_MODE:
-                print("Failed to decode LLM response as JSON.")
-            return 0.01  # Return a default score in case of JSON parsing failure
+            evaluation_response = EvaluationResponse.parse_raw(response)
+            score = evaluation_response.score
         except ValidationError as e:
-            if DEBUG_MODE:
-                print(f"Validation error for evaluation score: {e.json()}")
-            return 0.01  # Return a default score in case of validation failure
+            print("Evaluation response validation error:", e.json())
+            score = 0.01  # Default score if parsing or validation fails
 
-    def update_policy(self, action, reward, current_state):
-        one_hot_vector = HypothesisEnvironment.phase_to_one_hot(current_state.current_phase)
-        state_tensor = torch.FloatTensor(one_hot_vector).unsqueeze(0)
-        action_hot_vector = self.action_to_one_hot(action)
-        action_tensor = torch.FloatTensor(action_hot_vector).unsqueeze(0)
-        action_probabilities = self.policy_network(state_tensor)
-        action_probabilities_selected = action_probabilities.gather(1, action_tensor.long()).squeeze(1)
-        epsilon = 1e-6
-        log_prob = torch.log(action_probabilities_selected + epsilon)
-        loss = -log_prob * reward
-        loss = loss.mean()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        return score
 
-    def generate_initial_hypothesis(self):
-        human_prompt = self.get_human_prompt()
-        initial_hypothesis_prompt = textwrap.dedent(
-            f"""
-            Based on the following information, generate an initial hypothesis that involves science, 
-            requires critical thinking, demonstrates original thoughts, and is based in facts: 
-            {human_prompt}
-            """
-        )
-        response = self.get_llm_response(initial_hypothesis_prompt)
+    def generate_initial_hypothesis(self, initial_hypothesis=None):
+        hypothesis_prompt = initial_hypothesis
+        print(hypothesis_prompt)
+        response = self.get_llm_response(hypothesis_prompt)
+        print(response)
         if DEBUG_MODE:
             print(f"LLM Response (generate_initial_hypothesis): {response}")
         self.state.add_hypothesis(response)

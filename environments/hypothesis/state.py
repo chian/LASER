@@ -8,7 +8,10 @@ class State:
         self.knowledge_state = []  # Keep track of past information that is relevant and useful
         self.previous_score = None  # Add this line to keep track of the previous score
         self.latest_feedback = None  # Add this line to track the latest feedback
+        self.phase_to_index = None  # Add this line to allow phase to index mapping
 
+    def set_phase_to_index(self, phase_to_index):
+        self.phase_to_index = phase_to_index
 
     def transition(self, action):
         # Example transition logic
@@ -36,3 +39,10 @@ class State:
 
     def modify_current_hypothesis(self, modified_hypothesis):
         self.current_hypothesis = modified_hypothesis
+
+    def get_state_data(self, phase_to_index):
+        if phase_to_index is None:
+            raise ValueError("phase_to_index is not set.")
+        numeric_phase = self.phase_to_index.get(self.current_phase, -1)
+        return [numeric_phase, len(self.hypotheses), len(self.feedback), sum(self.scores)]
+
